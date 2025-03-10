@@ -2,7 +2,6 @@ package cachevin
 
 import (
 	"container/heap"
-	"context"
 	"sync/atomic"
 	"time"
 )
@@ -21,8 +20,8 @@ func NewUnsafe(capacity int, expire time.Duration, priorityFunc PriorityFunc) Ca
 			queue: make([]*entity, 0),
 			fun:   priorityFunc,
 		},
+		abort: make(chan struct{}),
 	}
-	cache.abort, cache.cancel = context.WithCancel(context.Background())
 	cache.state.Store(stateRunning)
 	go cache.run()
 	log.Infof("NewUnsafeCache capacity=%d, expire=%v", capacity, expire)
@@ -32,20 +31,19 @@ func NewUnsafe(capacity int, expire time.Duration, priorityFunc PriorityFunc) Ca
 // unsafeCache 并发不安全的缓存
 type unsafeCache struct {
 	capacity      int
-	expire        time.Duration      // 缓存过期时间
-	expireT       time.Duration      // 每100ms执行一次，检查key是否过期
-	cache         map[Key]*entity    // 存放缓存实体的map
-	priorityQueue *PriorityQueue     // 优先级队列，按优先级淘汰
-	state         atomic.Int32       // 状态
-	abort         context.Context    //
-	cancel        context.CancelFunc //
+	expire        time.Duration   // 缓存过期时间
+	expireT       time.Duration   // 每100ms执行一次，检查key是否过期
+	cache         map[Key]*entity // 存放缓存实体的map
+	priorityQueue *PriorityQueue  // 优先级队列，按优先级淘汰
+	state         atomic.Int32    // 状态
+	abort         chan struct{}
 }
 
 func (cache *unsafeCache) run() {
 	ticker := time.NewTicker(cache.expireT)
 	for cache.isRunning() {
 		select {
-		case <-cache.abort.Done():
+		case <-cache.abort:
 			// 缓存 Close 了
 			log.Infof("Exit run")
 		case <-ticker.C:
@@ -277,7 +275,7 @@ func (cache *unsafeCache) ClearWithTimeout(timeout time.Duration) error {
 }
 
 func (cache *unsafeCache) Close() {
+	close(cache.abort)
 	cache.state.Store(stateTerminate)
 	log.Infof("set state: %v", stateTerminate)
-	cache.cancel()
 }

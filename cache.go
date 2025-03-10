@@ -84,7 +84,7 @@ func (e *entity) call(cache *safeCache, key Key, fun ValueFunc) {
 	// Callback
 	if e.err != nil {
 		resp := make(chan response)
-		cache.operation <- &operation{
+		cache.oprChan <- &operation{
 			action: operationRemoveErr,
 			key:    key,
 			resp:   resp,

@@ -2,7 +2,6 @@ package cachevin
 
 import (
 	"container/heap"
-	"context"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -32,18 +31,18 @@ func NewSafe(capacity int, expire time.Duration, priorityFunc PriorityFunc) Cach
 		capacity = 1
 	}
 	cache := safeCache{
-		capacity:  capacity,
-		expire:    expire,
-		expireT:   defaultExpireT,
-		timeout:   defaultTimeout,
-		cache:     make(map[Key]*entity),
-		operation: make(chan *operation),
+		capacity: capacity,
+		expire:   expire,
+		expireT:  defaultExpireT,
+		timeout:  defaultTimeout,
+		cache:    make(map[Key]*entity),
+		oprChan:  make(chan *operation),
 		priorityQueue: &PriorityQueue{
 			queue: make([]*entity, 0),
 			fun:   priorityFunc,
 		},
+		abort: make(chan struct{}),
 	}
-	cache.abort, cache.cancel = context.WithCancel(context.Background())
 	cache.state.Store(stateRunning)
 	go cache.run()
 	log.Infof("NewSafeCache capacity=%d, expire=%v", capacity, expire)
@@ -54,15 +53,14 @@ func NewSafe(capacity int, expire time.Duration, priorityFunc PriorityFunc) Cach
 // 通过 channel 实现 goroutine 之间的同步
 type safeCache struct {
 	capacity      int
-	expire        time.Duration      // 缓存过期时间
-	timeout       time.Duration      // 超时时间
-	expireT       time.Duration      // 每100ms执行一次，检查key是否过期
-	cache         map[Key]*entity    // 存放缓存实体的map
-	priorityQueue *PriorityQueue     // 优先级队列，按优先级淘汰
-	operation     chan *operation    // 操作缓存 chan，所有操作在主 goroutine 执行，保证并发安全
-	state         atomic.Int32       // 状态
-	abort         context.Context    //
-	cancel        context.CancelFunc //
+	expire        time.Duration   // 缓存过期时间
+	timeout       time.Duration   // 超时时间
+	expireT       time.Duration   // 每100ms执行一次，检查key是否过期
+	cache         map[Key]*entity // 存放缓存实体的map
+	priorityQueue *PriorityQueue  // 优先级队列，按优先级淘汰
+	oprChan       chan *operation // 操作缓存 chan，所有操作在主 goroutine 执行，保证并发安全
+	state         atomic.Int32    // 状态
+	abort         chan struct{}
 }
 
 type operation struct {
@@ -82,40 +80,40 @@ func (cache *safeCache) run() {
 	ticker := time.NewTicker(cache.expireT)
 	for cache.isRunning() {
 		select {
-		case <-cache.abort.Done():
+		case <-cache.abort:
 			// 缓存 Close 了
 			log.Infof("Exit run")
 		case <-ticker.C:
 			// 检查key是否过期
 			cache.checkAndExpire()
-		case opera := <-cache.operation:
-			switch opera.action {
+		case opr := <-cache.oprChan:
+			switch opr.action {
 			case operationSet:
 				// 添加缓存key-value
-				err := cache.set(opera.key, opera.value)
-				opera.resp <- response{err: err}
+				err := cache.set(opr.key, opr.value)
+				opr.resp <- response{err: err}
 				break
 			case operationHas, operationGet:
 				// 是否存在指定Key的缓存,通过 Key 获取缓存的 Value
-				cache.get(opera)
+				cache.get(opr)
 				break
 			case operationGetWithLoad:
 				// 通过 Key 获取缓存的 Value
-				cache.getWithLoad(opera)
+				cache.getWithLoad(opr)
 				break
 			case operationRemove, operationRemoveErr:
 				// 通过 Key 删除缓存数据
-				err := cache.remove(opera.key)
-				opera.resp <- response{err: err}
+				err := cache.remove(opr.key)
+				opr.resp <- response{err: err}
 				break
 			case operationClear:
 				// 清除缓存
 				err := cache.clear()
-				opera.resp <- response{err: err}
+				opr.resp <- response{err: err}
 				break
 			default:
-				log.Warnf("un-support action: %d", opera.action)
-				opera.resp <- response{err: fmt.Errorf("un-support action: %d", opera.action)}
+				log.Warnf("un-support action: %d", opr.action)
+				opr.resp <- response{err: fmt.Errorf("un-support action: %d", opr.action)}
 				break
 			}
 		}
@@ -281,7 +279,7 @@ func (cache *safeCache) SetWithTimeout(key Key, value Value, timeout time.Durati
 	// 超时控制
 	timer := time.NewTimer(timeout)
 	resp := make(chan response)
-	cache.operation <- &operation{
+	cache.oprChan <- &operation{
 		action: operationSet,
 		key:    key,
 		value:  value,
@@ -307,7 +305,7 @@ func (cache *safeCache) HasWithTimeout(key Key, timeout time.Duration) (bool, er
 	// 超时控制
 	timer := time.NewTimer(timeout)
 	resp := make(chan response)
-	cache.operation <- &operation{
+	cache.oprChan <- &operation{
 		action: operationHas,
 		key:    key,
 		resp:   resp,
@@ -332,7 +330,7 @@ func (cache *safeCache) GetWithTimeout(key Key, timeout time.Duration) (Value, e
 	// 超时控制
 	timer := time.NewTimer(timeout)
 	resp := make(chan response)
-	cache.operation <- &operation{
+	cache.oprChan <- &operation{
 		action: operationGet,
 		key:    key,
 		resp:   resp,
@@ -357,7 +355,7 @@ func (cache *safeCache) GetLoadWithTimeout(key Key, fun ValueFunc, timeout time.
 	// 超时控制
 	timer := time.NewTimer(timeout)
 	resp := make(chan response)
-	cache.operation <- &operation{
+	cache.oprChan <- &operation{
 		action: operationGetWithLoad,
 		key:    key,
 		fun:    fun,
@@ -383,7 +381,7 @@ func (cache *safeCache) RemoveWithTimeout(key Key, timeout time.Duration) error 
 	// 超时控制
 	timer := time.NewTimer(timeout)
 	resp := make(chan response)
-	cache.operation <- &operation{
+	cache.oprChan <- &operation{
 		action: operationRemove,
 		key:    key,
 		resp:   resp,
@@ -408,7 +406,7 @@ func (cache *safeCache) ClearWithTimeout(timeout time.Duration) error {
 	// 超时控制
 	timer := time.NewTimer(timeout)
 	resp := make(chan response)
-	cache.operation <- &operation{
+	cache.oprChan <- &operation{
 		action: operationClear,
 		resp:   resp,
 	}
@@ -422,7 +420,7 @@ func (cache *safeCache) ClearWithTimeout(timeout time.Duration) error {
 }
 
 func (cache *safeCache) Close() {
+	close(cache.abort)
 	cache.state.Store(stateTerminate)
 	log.Infof("set state: %v", stateTerminate)
-	cache.cancel()
 }

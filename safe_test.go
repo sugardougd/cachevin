@@ -2,7 +2,9 @@ package cachevin
 
 import (
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -168,14 +170,22 @@ func Test_safeFIFOCache_GetLoadErr(t *testing.T) {
 	t.Run("Test_safeFIFOCache_GetLoad", func(t *testing.T) {
 		cache := NewSafe(3, 0, FIFOPriorityFunc)
 		defer cache.Close()
-		items := []string{"a", "b", "c"}
+		items := []string{"a", "a"}
+		var wg sync.WaitGroup
 		for _, i := range items {
-			if _, err := cache.GetLoad(i, func(k Key) (Value, error) {
-				return strings.ToUpper(k), errors.New("test")
-			}); err == nil || err == NotFound {
-				t.Errorf("GetLoad(%v) success,but want error", i)
-			}
+			wg.Add(1)
+			go func(i string, wg *sync.WaitGroup) {
+				defer wg.Done()
+				if _, err := cache.GetLoad(i, func(k Key) (Value, error) {
+					time.Sleep(time.Millisecond * 50)
+					fmt.Printf("Load(%s)\n", i)
+					return strings.ToUpper(k), errors.New("test " + k)
+				}); err == nil || err == NotFound {
+					t.Errorf("GetLoad(%s) success,but want error", i)
+				}
+			}(i, &wg)
 		}
+		wg.Wait()
 		if cache.Len() != 0 {
 			t.Errorf("cache len is %d want %d", cache.Len(), 0)
 		}
